@@ -13,6 +13,8 @@ use std::process::exit;
 use clap::Parser;
 use rusqlite::Connection;
 
+use wow_dbc_converter::Expansion;
+
 /// Convert DBC files to SQLite databases
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -46,26 +48,7 @@ struct Args {
     strict_mode: bool,
 }
 
-#[derive(Debug, Copy, Clone, clap::ValueEnum)]
-pub(crate) enum Expansion {
-    Vanilla,
-    BurningCrusade,
-    Wrath,
-}
 
-impl Display for Expansion {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Expansion::Vanilla => "Vanilla (1.12.x.y)",
-                Expansion::BurningCrusade => "The Burning Crusade (2.4.3.8606)",
-                Expansion::Wrath => "Wrath of the Lich King (3.3.5.12340)",
-            }
-        )
-    }
-}
 
 #[derive(Debug, Clone)]
 struct Options {
@@ -117,6 +100,8 @@ fn main() {
     };
 
     files.iter().for_each(|a| apply_file(&options, a));
+
+    post_process_database(&options);
 }
 
 fn apply_file(options: &Options, file: &PathBuf) {
@@ -188,6 +173,7 @@ fn apply_file(options: &Options, file: &PathBuf) {
                     );
                 }
             }
+
         }
         Expansion::BurningCrusade => {
             match tbc_tables_sqlite::write_to_sqlite(&mut conn, file_name, &mut contents.as_slice())
@@ -335,5 +321,82 @@ fn options(args: Args) -> Options {
         output_path,
         expansion: args.dbc_version,
         strict_mode: args.strict_mode,
+    }
+}
+
+fn post_process_database(options: &Options) {
+    let conn = match Connection::open(&options.output_path) {
+        Ok(e) => e,
+        Err(e) => {
+            println!("Unable to open SQLite database for post-processing: {}", e);
+            return;
+        }
+    };
+
+    let mut stmt = match conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name") {
+        Ok(s) => s,
+        Err(e) => {
+            println!("Failed to prepare table list statement: {}", e);
+            return;
+        }
+    };
+
+    let names = stmt.query_map([], |row| row.get::<_, String>(0))
+        .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>());
+
+    match names {
+        Ok(n) => {
+            println!("\nTables present in database ({} total):", n.len());
+
+            // Create the 'dbc' directory at the target location
+            let mut dbc_dir = options.output_path.clone();
+            if dbc_dir.is_file() {
+                dbc_dir.pop();
+            }
+            dbc_dir.push("dbc");
+
+            if let Err(e) = create_dir_all(&dbc_dir) {
+                println!("Failed to create directory '{}': {}", dbc_dir.display(), e);
+                return;
+            }
+
+            for name in n {
+                println!("  - {}", name);
+
+                let mut file_path = dbc_dir.clone();
+                file_path.push(format!("{}.dbc", name));
+
+                match std::fs::File::create(&file_path) {
+                    Ok(file) => {
+                        let mut writer = std::io::BufWriter::new(file);
+                        let result = match options.expansion {
+                            Expansion::Vanilla => {
+                                vanilla_tables_sqlite::generate_dbc_for(&name, &conn, &mut writer)
+                            }
+                            Expansion::BurningCrusade => {
+                                tbc_tables_sqlite::generate_dbc_for(&name, &conn, &mut writer)
+                            }
+                            Expansion::Wrath => {
+                                wrath_tables_sqlite::generate_dbc_for(&name, &conn, &mut writer)
+                            }
+                        };
+
+                        if let Err(e) = result {
+                            recoverable_error(
+                                format!("Failed to generate DBC data for '{}': {}", name, e),
+                                "Continuing to next table",
+                                options,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        println!("    ! Failed to create file '{}': {}", file_path.display(), e);
+                    }
+                }
+            }
+            println!("\nDBC files generated in: {}", dbc_dir.display());
+            println!("\nEmpty DBC files created in: {}", dbc_dir.display());
+        }
+        Err(e) => println!("Error retrieving table names: {}", e),
     }
 }
